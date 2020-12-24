@@ -28,6 +28,20 @@ func (f *File) readFrom(r io.Reader) (written int64, handled bool, err error) {
 		}
 	}
 
+	// compatible without code change to io.LimitWriter
+	// just use io.LimitReader like this:
+	// f := *os.File ...
+	// conn := *net.TCPConn ...
+	// io.Copy(f, io.LimitReader(conn, size))
+	// but, avoid cycle import, can not use r.(*net.TCPConn)
+	// just check io.WriterTo, because *File is not implement io.WriterTo
+	// when r is a *File, copy file range is still ok.
+	wt, ok := r.(io.WriterTo)
+	if ok {
+		w, e := wt.WriteTo(io.LimitWriter(f, remain))
+		return w, true, e
+	}
+
 	src, ok := r.(*File)
 	if !ok {
 		return 0, false, nil
