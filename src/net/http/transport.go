@@ -1934,6 +1934,14 @@ func (pc *persistConn) Read(p []byte) (n int, err error) {
 	return
 }
 
+func (pc *persistConn) WriteTo(w io.Writer) (n int64, err error) {
+	// FIXME verify *io.LimitedWriter and pc.readLimit
+	if c, ok := pc.conn.(io.WriterTo); ok {
+		return c.WriteTo(w)
+	}
+	return io.Copy(w, readerOnly{pc})
+}
+
 // isBroken reports whether this connection is in a known broken state.
 func (pc *persistConn) isBroken() bool {
 	pc.mu.Lock()
@@ -2781,6 +2789,21 @@ func (es *bodyEOFSignal) Read(p []byte) (n int, err error) {
 		err = es.condfn(err)
 	}
 	return
+}
+
+type readerOnly struct {
+	io.Reader
+}
+
+func (es *bodyEOFSignal) WriteTo(w io.Writer) (n int64, err error) {
+	if b, ok := es.body.(*body); ok {
+		if lr, ok := b.src.(*io.LimitedReader); ok {
+			if br, ok := lr.R.(*bufio.Reader); ok {
+				return br.WriteTo(io.LimitWriter(w, lr.N))
+			}
+		}
+	}
+	return io.Copy(w, readerOnly{es})
 }
 
 func (es *bodyEOFSignal) Close() error {
