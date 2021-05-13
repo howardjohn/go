@@ -176,6 +176,9 @@ type halfConn struct {
 	nextMac    hash.Hash // next MAC algorithm
 
 	trafficSecret []byte // current TLS 1.3 traffic secret
+
+	key []byte // encrypt or decrypt key for kernel tls
+	iv  []byte // encrypt or decrypt iv for kernel tls
 }
 
 type permanentError struct {
@@ -222,8 +225,8 @@ func (hc *halfConn) changeCipherSpec() error {
 
 func (hc *halfConn) setTrafficSecret(suite *cipherSuiteTLS13, secret []byte) {
 	hc.trafficSecret = secret
-	key, iv := suite.trafficKey(secret)
-	hc.cipher = suite.aead(key, iv)
+	hc.key, hc.iv = suite.trafficKey(secret)
+	hc.cipher = suite.aead(hc.key, hc.iv)
 	for i := range hc.seq {
 		hc.seq[i] = 0
 	}
@@ -262,6 +265,8 @@ func (hc *halfConn) explicitNonceLen() int {
 		if hc.version >= VersionTLS11 {
 			return c.BlockSize()
 		}
+		return 0
+	case kTLSCipher:
 		return 0
 	default:
 		panic("unknown cipher type")
@@ -395,6 +400,15 @@ func (hc *halfConn) decrypt(record []byte) ([]byte, recordType, error) {
 			// long as the digest computation is constant time and does not
 			// affect the subsequent write, modulo cache effects.
 			paddingLen, paddingGood = extractPadding(payload)
+		//case kTLSCipher:
+		//	if recordType(record[0]) == recordTypeAlert {
+		//		log.Printf("kTLS decrypt: dropped alert on the floor")
+		//		return record[:recordHeaderLen], recordTypeAlert, nil
+		//	} else if recordType(record[0]) != recordTypeApplicationData {
+		//		panic("kTLS decrypt: tried to receive unsupported data type")
+		//	}
+		//	log.Printf("kTLS decrypt: received %d bytes of plaintext from the kernel", len(payload))
+		//	return payload, recordTypeApplicationData, nil
 		default:
 			panic("unknown cipher type")
 		}
@@ -612,8 +626,26 @@ func (c *Conn) readRecordOrCCS(expectChangeCipherSpec bool) error {
 	}
 	c.input.Reset(nil)
 
+	var (
+		typ    recordType
+		data   []byte
+		record []byte
+		hdr    []byte
+		n      int
+		vers   uint16
+		err    error
+	)
+
+	if _, ok := c.in.cipher.(kTLSCipher); ok {
+		data = make([]byte, maxPlaintext)
+		if typ, n, err = ktlsReadRecord(c.conn.(*net.TCPConn), data); err != nil {
+			return err
+		}
+		data = data[:n]
+		goto processMessage
+	}
 	// Read header, payload.
-	if err := c.readFromUntil(c.conn, recordHeaderLen); err != nil {
+	if err = c.readFromUntil(c.conn, recordHeaderLen); err != nil {
 		// RFC 8446, Section 6.1 suggests that EOF without an alertCloseNotify
 		// is an error, but popular web sites seem to do this, so we accept it
 		// if and only if at the record boundary.
@@ -625,8 +657,8 @@ func (c *Conn) readRecordOrCCS(expectChangeCipherSpec bool) error {
 		}
 		return err
 	}
-	hdr := c.rawInput.Bytes()[:recordHeaderLen]
-	typ := recordType(hdr[0])
+	hdr = c.rawInput.Bytes()[:recordHeaderLen]
+	typ = recordType(hdr[0])
 
 	// No valid TLS record has a type of 0x80, however SSLv2 handshakes
 	// start with a uint16 length where the MSB is set and the first record
@@ -637,8 +669,8 @@ func (c *Conn) readRecordOrCCS(expectChangeCipherSpec bool) error {
 		return c.in.setErrorLocked(c.newRecordHeaderError(nil, "unsupported SSLv2 handshake received"))
 	}
 
-	vers := uint16(hdr[1])<<8 | uint16(hdr[2])
-	n := int(hdr[3])<<8 | int(hdr[4])
+	vers = uint16(hdr[1])<<8 | uint16(hdr[2])
+	n = int(hdr[3])<<8 | int(hdr[4])
 	if c.haveVers && c.vers != VersionTLS13 && vers != c.vers {
 		c.sendAlert(alertProtocolVersion)
 		msg := fmt.Sprintf("received record with version %x when expecting version %x", vers, c.vers)
@@ -666,11 +698,13 @@ func (c *Conn) readRecordOrCCS(expectChangeCipherSpec bool) error {
 	}
 
 	// Process message.
-	record := c.rawInput.Next(recordHeaderLen + n)
-	data, typ, err := c.in.decrypt(record)
+	record = c.rawInput.Next(recordHeaderLen + n)
+	data, typ, err = c.in.decrypt(record)
 	if err != nil {
 		return c.in.setErrorLocked(c.sendAlert(err.(alert)))
 	}
+
+processMessage:
 	if len(data) > maxPlaintext {
 		return c.in.setErrorLocked(c.sendAlert(alertRecordOverflow))
 	}
@@ -891,6 +925,8 @@ func (c *Conn) maxPayloadSizeForWrite(typ recordType) int {
 			// The MAC is appended before padding so affects the
 			// payload size directly.
 			payloadBytes -= c.out.mac.Size()
+		case kTLSCipher:
+			payloadBytes -= kTLSOverhead
 		default:
 			panic("unknown cipher type")
 		}
@@ -946,6 +982,19 @@ var outBufPool = sync.Pool{
 // writeRecordLocked writes a TLS record with the given type and payload to the
 // connection and updates the record layer state.
 func (c *Conn) writeRecordLocked(typ recordType, data []byte) (int, error) {
+	if _, ok := c.out.cipher.(kTLSCipher); ok {
+		switch typ {
+		case recordTypeAlert:
+			return ktlsSendCtrlMessage(c.conn.(*net.TCPConn), typ, data)
+		case recordTypeHandshake, recordTypeChangeCipherSpec:
+			//return 0, fmt.Errorf("unsupported record type: %d", typ)
+			return ktlsSendCtrlMessage(c.conn.(*net.TCPConn), typ, data)
+		case recordTypeApplicationData:
+			return c.write(data)
+		default:
+			panic("unknown record type")
+		}
+	}
 	outBufPtr := outBufPool.Get().(*[]byte)
 	outBuf := *outBufPtr
 	defer func() {
@@ -1138,6 +1187,11 @@ func (c *Conn) Write(b []byte) (int, error) {
 		return 0, errShutdown
 	}
 
+	// when enable ktls, did not need write record any more
+	if _, ktls := c.in.cipher.(kTLSCipher); ktls {
+		return c.write(b)
+	}
+
 	// TLS 1.0 is susceptible to a chosen-plaintext
 	// attack when using block mode ciphers due to predictable IVs.
 	// This can be prevented by splitting each Application Data
@@ -1282,6 +1336,17 @@ func (c *Conn) Read(b []byte) (int, error) {
 
 	c.in.Lock()
 	defer c.in.Unlock()
+
+	// when enable ktls, did not need read record any more
+	if _, ktls := c.in.cipher.(kTLSCipher); ktls {
+		n, err := ktlsReadDataFromRecord(c.conn.(*net.TCPConn), b)
+		// when there is no record, the connection is lost or EOF
+		// just read from connection
+		if err == nil && n == 0 {
+			return c.conn.Read(b)
+		}
+		return n, err
+	}
 
 	for c.input.Len() == 0 {
 		if err := c.readRecord(); err != nil {

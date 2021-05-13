@@ -84,6 +84,10 @@ func (hs *serverHandshakeStateTLS13) handshake() error {
 
 	atomic.StoreUint32(&c.handshakeStatus, 1)
 
+	//if err := c.enableKernelTLS(c.cipherSuite, c.in.key, c.out.key, c.in.iv, c.out.iv); err != nil {
+	//	return err
+	//}
+
 	return nil
 }
 
