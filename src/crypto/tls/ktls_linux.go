@@ -1,10 +1,10 @@
+//go:build linux
 // +build linux
 
 package tls
 
 import (
 	"fmt"
-	"golang.org/x/sys/unix"
 	"io"
 	"log"
 	"net"
@@ -13,6 +13,8 @@ import (
 	"strings"
 	"syscall"
 	"unsafe"
+
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -97,6 +99,7 @@ func init() {
 	if (major == 5 && minor >= 11) || major > 5 {
 		kTLSSupportCHACHA20POLY1305 = true
 	}
+	log.Printf("KTLS enabled\n")
 }
 
 func (c *Conn) ReadFrom(r io.Reader) (n int64, err error) {
@@ -284,6 +287,7 @@ func (c *Conn) WriteTo(w io.Writer) (n int64, err error) {
 }
 
 func (c *Conn) enableKernelTLS(cipherSuiteID uint16, inKey, outKey, inIV, outIV []byte) error {
+	log.Println("checking ktls... ", cipherSuiteID, kTLSEnabled)
 	if !kTLSSupport {
 		return nil
 	}

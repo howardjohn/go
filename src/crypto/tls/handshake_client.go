@@ -221,6 +221,7 @@ func (c *Conn) clientHandshake(ctx context.Context) (err error) {
 			binderKey:   binderKey,
 		}
 
+		log.Println("TLS 1.3 handshake, kTLS disabled")
 		// In TLS 1.3, session tickets are delivered after the handshake.
 		return hs.handshake()
 	}

@@ -22,6 +22,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"strings"
@@ -154,6 +155,7 @@ func dial(ctx context.Context, netDialer *net.Dialer, network, addr string, conf
 	}
 
 	conn := Client(rawConn, config)
+	log.Println("dial: Handshaking")
 	if err := conn.HandshakeContext(ctx); err != nil {
 		rawConn.Close()
 		return nil, err

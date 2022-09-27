@@ -10,6 +10,12 @@ import (
 	"os"
 )
 
+type netConner interface {
+	NetConn() Conn
+}
+
+var ktlsSplice = os.Getenv("KTLS_SPLICE") == "true"
+
 // splice transfers data from r to c using the splice system call to minimize
 // copies from and to userspace. c must be a TCP connection. Currently, splice
 // is only enabled if r is a TCP or a stream-oriented Unix connection.
@@ -33,6 +39,8 @@ func splice(c *netFD, r io.Reader) (written int64, err error, handled bool) {
 			return 0, nil, false
 		}
 		s = uc.fd
+	} else if tlsc, ok := r.(netConner); ktlsSplice && ok {
+		s = tlsc.NetConn().(*TCPConn).fd
 	} else {
 		return 0, nil, false
 	}
